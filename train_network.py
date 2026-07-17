@@ -62,6 +62,196 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# profiling things
+from torch.profiler import profile, ProfilerActivity, record_function
+from pathlib import Path
+trace_dir = Path("./profiler_traces")
+trace_dir.mkdir(parents=True, exist_ok=True)
+
+MB = 1024 ** 2
+
+def trace_handler(prof):
+    trace_path = trace_dir / f"trace_step_{prof.step_num}.json"
+    prof.export_chrome_trace(str(trace_path))
+    print(f"Saved profiler trace to: {trace_path}")
+
+
+class ModuleRangeHook:
+    def __init__(self):
+        self.handles = []
+
+        self.forward_contexts = {}
+        self.backward_contexts = {}
+
+        self.forward_memory = {}
+        self.backward_memory = {}
+
+        self.records = []
+
+    @staticmethod
+    def _current_memory():
+        return {
+            "allocated": torch.cuda.memory_allocated(),
+            "reserved": torch.cuda.memory_reserved(),
+        }
+
+    def _start_memory_range(self, storage, mod):
+        # Peak statistics are global to the current CUDA device.
+        # This is suitable when profiling only the top-level UNet.
+        torch.cuda.reset_peak_memory_stats()
+
+        stats = torch.cuda.memory_stats()
+
+        storage[id(mod)] = {
+            "start": self._current_memory(),
+
+            # Accumulated allocator counters let us estimate gross allocations
+            # and frees during the range.
+            "allocated_total_start":
+                stats["allocated_bytes.all.allocated"],
+
+            "freed_total_start":
+                stats["allocated_bytes.all.freed"],
+        }
+
+    def _finish_memory_range(self, storage, mod, name, phase):
+        state = storage.pop(id(mod), None)
+
+        if state is None:
+            return
+
+        stats = torch.cuda.memory_stats()
+        end = self._current_memory()
+
+        start_allocated = state["start"]["allocated"]
+        end_allocated = end["allocated"]
+
+        peak_allocated = torch.cuda.max_memory_allocated()
+        peak_reserved = torch.cuda.max_memory_reserved()
+
+        gross_allocated = (
+            stats["allocated_bytes.all.allocated"]
+            - state["allocated_total_start"]
+        )
+
+        gross_freed = (
+            stats["allocated_bytes.all.freed"]
+            - state["freed_total_start"]
+        )
+
+        self.records.append({
+            "module": name,
+            "phase": phase,
+
+            # Live tensor memory at range boundaries.
+            "start_allocated_mb": start_allocated / MB,
+            "end_allocated_mb": end_allocated / MB,
+            "net_change_mb": (end_allocated - start_allocated) / MB,
+
+            # Highest live tensor memory reached during the range.
+            "peak_allocated_mb": peak_allocated / MB,
+            "peak_increase_mb":
+                (peak_allocated - start_allocated) / MB,
+
+            # Caching allocator reservation.
+            "start_reserved_mb":
+                state["start"]["reserved"] / MB,
+            "end_reserved_mb":
+                end["reserved"] / MB,
+            "peak_reserved_mb":
+                peak_reserved / MB,
+
+            # Total allocation/free traffic during the range.
+            "gross_allocated_mb": gross_allocated / MB,
+            "gross_freed_mb": gross_freed / MB,
+        })
+
+    def add(self, name, module):
+        def forward_pre_hook(mod, inputs):
+            ctx = record_function(f"{name}.forward")
+            ctx.__enter__()
+            self.forward_contexts[id(mod)] = ctx
+
+            self._start_memory_range(self.forward_memory, mod)
+
+        def forward_post_hook(mod, inputs, output):
+            self._finish_memory_range(
+                self.forward_memory,
+                mod,
+                name,
+                "forward",
+            )
+
+            ctx = self.forward_contexts.pop(id(mod), None)
+            if ctx is not None:
+                ctx.__exit__(None, None, None)
+
+        def backward_pre_hook(mod, grad_output):
+            ctx = record_function(f"{name}.backward")
+            ctx.__enter__()
+            self.backward_contexts[id(mod)] = ctx
+
+            self._start_memory_range(self.backward_memory, mod)
+
+        def backward_post_hook(mod, grad_input, grad_output):
+            self._finish_memory_range(
+                self.backward_memory,
+                mod,
+                name,
+                "backward",
+            )
+
+            ctx = self.backward_contexts.pop(id(mod), None)
+            if ctx is not None:
+                ctx.__exit__(None, None, None)
+
+        self.handles.append(
+            module.register_forward_pre_hook(forward_pre_hook)
+        )
+        self.handles.append(
+            module.register_forward_hook(forward_post_hook)
+        )
+        self.handles.append(
+            module.register_full_backward_pre_hook(backward_pre_hook)
+        )
+        self.handles.append(
+            module.register_full_backward_hook(backward_post_hook)
+        )
+
+    def save_memory_report(self, path):
+        report = {
+            "global": {
+                "peak_allocated_mb": torch.cuda.max_memory_allocated() / MB,
+                "peak_reserved_mb": torch.cuda.max_memory_reserved() / MB,
+            },
+            "ranges": self.records,
+        }
+
+        with open(path, "w") as f:
+            json.dump(report, f, indent=2)
+
+    def print_memory_report(self):
+        for record in self.records:
+            print(
+                f'{record["module"]}.{record["phase"]}: '
+                f'peak increase='
+                f'{record["peak_increase_mb"]:.1f} MiB, '
+                f'net change={record["net_change_mb"]:.1f} MiB, '
+                f'gross allocated='
+                f'{record["gross_allocated_mb"]:.1f} MiB, '
+                f'gross freed='
+                f'{record["gross_freed_mb"]:.1f} MiB'
+            )
+
+    def remove(self):
+        for handle in self.handles:
+            handle.remove()
+
+        self.handles.clear()
+        self.forward_contexts.clear()
+        self.backward_contexts.clear()
+        self.forward_memory.clear()
+        self.backward_memory.clear()
 
 class NetworkTrainer:
     def __init__(self):
@@ -1570,6 +1760,37 @@ class NetworkTrainer:
                     torch.cuda.set_rng_state(gpu_rng_state)
             random.setstate(python_rng_state)
 
+        
+
+
+        module_range_hook = ModuleRangeHook()
+
+        unwrapped_unet = accelerator.unwrap_model(unet)
+
+        module_range_hook.add(
+            "unet",
+            unwrapped_unet,
+        )
+
+        torch.cuda.memory._record_memory_history(
+            enabled="all",
+            max_entries=100000,
+        )
+
+        prof = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(wait=0, warmup=0, active=3, repeat=1),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            on_trace_ready=trace_handler,
+        ) 
+
+        prof.start()
+
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}\n")
             current_epoch.value = epoch + 1
@@ -1594,41 +1815,53 @@ class NetworkTrainer:
                     on_step_start_for_network(text_encoder, unet)
 
                     # preprocess batch for each model
-                    self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True)
 
-                    loss = self.process_batch(
-                        batch,
-                        text_encoders,
-                        unet,
-                        network,
-                        vae,
-                        noise_scheduler,
-                        vae_dtype,
-                        weight_dtype,
-                        accelerator,
-                        args,
-                        text_encoding_strategy,
-                        tokenize_strategy,
-                        is_train=True,
-                        train_text_encoder=train_text_encoder,
-                        train_unet=train_unet,
-                    )
+                    with record_function("pre-step hook"):
+                        self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True)
 
-                    accelerator.backward(loss)
-                    if accelerator.sync_gradients:
-                        self.all_reduce_network(accelerator, network)  # sync DDP grad manually
-                        if args.max_grad_norm != 0.0:
-                            params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
-                            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                    with record_function("forward"):
+                        loss = self.process_batch(
+                            batch,
+                            text_encoders,
+                            unet,
+                            network,
+                            vae,
+                            noise_scheduler,
+                            vae_dtype,
+                            weight_dtype,
+                            accelerator,
+                            args,
+                            text_encoding_strategy,
+                            tokenize_strategy,
+                            is_train=True,
+                            train_text_encoder=train_text_encoder,
+                            train_unet=train_unet,
+                        )
 
-                        if hasattr(network, "update_grad_norms"):
-                            network.update_grad_norms()
-                        if hasattr(network, "update_norms"):
-                            network.update_norms()
+                    with record_function("backward"):
+                        accelerator.backward(loss)
 
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
+                        if accelerator.sync_gradients:
+                            self.all_reduce_network(accelerator, network)  # sync DDP grad manually
+                            if args.max_grad_norm != 0.0:
+                                params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
+                                accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+
+                            if hasattr(network, "update_grad_norms"):
+                                network.update_grad_norms()
+                            if hasattr(network, "update_norms"):
+                                network.update_norms()
+
+                    with record_function("optimizer_step"):
+                        optimizer.step()
+
+                    with record_function("lr_scheduler_step"):    
+                        lr_scheduler.step()
+                    
+                    with record_function("zero grad"):
+                        optimizer.zero_grad(set_to_none=True)
+
+                    prof.step()
 
                 if args.scale_weight_norms:
                     keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
@@ -1834,6 +2067,31 @@ class NetworkTrainer:
             optimizer_train_fn()
 
             # end of epoch
+        
+        prof.stop()
+        print(
+            prof.key_averages().table(
+                sort_by="self_cuda_time_total",
+                row_limit=20,
+            )
+        )
+        prof.export_memory_timeline(f"nico_sdxl_memory.html", device="cuda:0")
+        try:
+            torch.cuda.memory._dump_snapshot("nico_sdxl_memory.pickle")
+        except Exception as e:
+            logger.error(f"Failed to capture memory snapshot {e}")
+
+        # Stop recording memory snapshot history.
+        torch.cuda.memory._record_memory_history(enabled=None)
+
+
+        module_range_hook.save_memory_report(
+            "nico_sdxl_memory_ranges.json"
+        )
+
+        module_range_hook.print_memory_report()
+        module_range_hook.remove()
+
 
         # metadata["ss_epoch"] = str(num_train_epochs)
         self._metadata["ss_training_finished_at"] = str(time.time())
